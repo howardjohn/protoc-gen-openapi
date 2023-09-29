@@ -47,10 +47,8 @@ func generate(request plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorRespons
 	perFile := false
 	singleFile := false
 	yaml := false
-	useRef := false
 	includeDescription := true
 	enumAsIntOrString := false
-	var messagesWithEmptySchema []string
 
 	p := extractParams(request.GetParameter())
 	for k, v := range p {
@@ -77,15 +75,6 @@ func generate(request plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorRespons
 			}
 		} else if k == "yaml" {
 			yaml = true
-		} else if k == "use_ref" {
-			switch strings.ToLower(v) {
-			case "true":
-				useRef = true
-			case "false":
-				useRef = false
-			default:
-				return nil, fmt.Errorf("unknown value '%s' for use_ref", v)
-			}
 		} else if k == "include_description" {
 			switch strings.ToLower(v) {
 			case "true":
@@ -104,8 +93,6 @@ func generate(request plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorRespons
 			default:
 				return nil, fmt.Errorf("unknown value '%s' for enum_as_int_or_string", v)
 			}
-		} else if k == "additional_empty_schema" {
-			messagesWithEmptySchema = strings.Split(v, "+")
 		} else {
 			return nil, fmt.Errorf("unknown argument '%s' specified", k)
 		}
@@ -131,10 +118,8 @@ func generate(request plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorRespons
 		perFile,
 		singleFile,
 		yaml,
-		useRef,
 		descriptionConfiguration,
-		enumAsIntOrString,
-		messagesWithEmptySchema)
+		enumAsIntOrString)
 	return g.generateOutput(filesToGen)
 }
 

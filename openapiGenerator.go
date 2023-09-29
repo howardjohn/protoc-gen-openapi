@@ -18,12 +18,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"log"
 	"math"
 	"os"
 	"path"
 	"strings"
 
 	"github.com/solo-io/protoc-gen-openapi/pkg/protomodel"
+	apiext "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/ghodss/yaml"
@@ -86,7 +90,6 @@ type openapiGenerator struct {
 	perFile    bool
 	singleFile bool
 	yaml       bool
-	useRef     bool
 
 	// transient state as individual files are processed
 	currentPackage             *protomodel.PackageDescriptor
@@ -100,9 +103,6 @@ type openapiGenerator struct {
 	// @solo.io customization to support enum validation schemas with int or string values
 	// we need to support this since some controllers marshal enums as integers and others as strings
 	enumAsIntOrString bool
-
-	// @solo.io customizations to define schemas for certain messages
-	customSchemasByMessageName map[string]openapi3.Schema
 }
 
 type DescriptionConfiguration struct {
@@ -115,51 +115,17 @@ func newOpenAPIGenerator(
 	perFile bool,
 	singleFile bool,
 	yaml bool,
-	useRef bool,
 	descriptionConfiguration *DescriptionConfiguration,
 	enumAsIntOrString bool,
-	messagesWithEmptySchema []string,
 ) *openapiGenerator {
 	return &openapiGenerator{
-		model:                      model,
-		perFile:                    perFile,
-		singleFile:                 singleFile,
-		yaml:                       yaml,
-		useRef:                     useRef,
-		descriptionConfiguration:   descriptionConfiguration,
-		enumAsIntOrString:          enumAsIntOrString,
-		customSchemasByMessageName: buildCustomSchemasByMessageName(messagesWithEmptySchema),
+		model:                    model,
+		perFile:                  perFile,
+		singleFile:               singleFile,
+		yaml:                     yaml,
+		descriptionConfiguration: descriptionConfiguration,
+		enumAsIntOrString:        enumAsIntOrString,
 	}
-}
-
-// buildCustomSchemasByMessageName name returns a mapping of message name to a pre-defined openapi schema
-// It includes:
-//  1. `specialSoloTypes`, a set of pre-defined schemas
-//  2. `messagesWithEmptySchema`, a list of messages that are injected at runtime that should contain
-//     and empty schema which accepts and preserves all fields
-func buildCustomSchemasByMessageName(messagesWithEmptySchema []string) map[string]openapi3.Schema {
-	schemasByMessageName := make(map[string]openapi3.Schema)
-
-	// Initialize the hard-coded values
-	for name, schema := range specialSoloTypes {
-		schemasByMessageName[name] = schema
-	}
-
-	// Add the messages that were injected at runtime
-	for _, messageName := range messagesWithEmptySchema {
-		emptyMessage := openapi3.Schema{
-			Type:       openapi3.TypeObject,
-			Properties: make(map[string]*openapi3.SchemaRef),
-			ExtensionProps: openapi3.ExtensionProps{
-				Extensions: map[string]interface{}{
-					"x-kubernetes-preserve-unknown-fields": true,
-				},
-			},
-		}
-		schemasByMessageName[messageName] = emptyMessage
-	}
-
-	return schemasByMessageName
 }
 
 func (g *openapiGenerator) generateOutput(filesToGen map[*protomodel.FileDescriptor]bool) (*plugin.CodeGeneratorResponse, error) {
@@ -279,7 +245,7 @@ func (g *openapiGenerator) generateFile(name string,
 
 	g.messages = messages
 
-	allSchemas := make(map[string]*openapi3.SchemaRef)
+	allSchemas := make(map[string]*apiext.JSONSchemaProps)
 
 	for _, message := range messages {
 		// we generate the top-level messages here and the nested messages are generated
@@ -296,55 +262,76 @@ func (g *openapiGenerator) generateFile(name string,
 		}
 	}
 
-	var version string
-	var description string
 	// only get the API version when generate per package or per file,
 	// as we cannot guarantee all protos in the input are the same version.
-	if !g.singleFile {
-		if g.currentFrontMatterProvider != nil && g.currentFrontMatterProvider.Matter.Description != "" {
-			description = g.currentFrontMatterProvider.Matter.Description
-		} else if pd := g.generateDescription(g.currentPackage); pd != "" {
-			description = pd
-		} else {
-			description = "OpenAPI Spec for Solo APIs."
-		}
-		// derive the API version from the package name
-		// which is a convention for Istio APIs.
-		var p string
-		if pkg != nil {
-			p = pkg.GetPackage()
-		} else {
-			p = name
-		}
-		s := strings.Split(p, ".")
-		version = s[len(s)-1]
-	} else {
-		description = "OpenAPI Spec for Solo APIs."
+	//if !g.singleFile {
+	//	if g.currentFrontMatterProvider != nil && g.currentFrontMatterProvider.Matter.Description != "" {
+	//		description = g.currentFrontMatterProvider.Matter.Description
+	//	} else if pd := g.generateDescription(g.currentPackage); pd != "" {
+	//		description = pd
+	//	} else {
+	//		description = "OpenAPI Spec for Solo APIs."
+	//	}
+	//	// derive the API version from the package name
+	//	// which is a convention for Istio APIs.
+	//	var p string
+	//	if pkg != nil {
+	//		p = pkg.GetPackage()
+	//	} else {
+	//		p = name
+	//	}
+	//	s := strings.Split(p, ".")
+	//	version = s[len(s)-1]
+	//} else {
+	//	description = "OpenAPI Spec for Solo APIs."
+	//}
+
+	// add the openapi object required by the spec.
+
+	groupKind := schema.GroupKind{
+		Group: "group",
+		Kind:  "kind",
 	}
 
-	c := openapi3.NewComponents()
-	c.Schemas = allSchemas
-	// add the openapi object required by the spec.
-	o := openapi3.T{
-		OpenAPI: "3.0.1",
-		Info: &openapi3.Info{
-			Title:   description,
-			Version: version,
+	crd := apiext.CustomResourceDefinition{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "apiextensions.k8s.io/v1",
+			Kind:       "CustomResourceDefinition",
 		},
-		Components: c,
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "plural" + "." + groupKind.Group,
+		},
+		Spec: apiext.CustomResourceDefinitionSpec{
+			Group: groupKind.Group,
+			Names: apiext.CustomResourceDefinitionNames{
+				Kind:     groupKind.Kind,
+				ListKind: groupKind.Kind + "List",
+				Plural:   "plural",
+				Singular: strings.ToLower(groupKind.Kind),
+			},
+			Scope: apiext.NamespaceScoped,
+		},
 	}
+	ver := apiext.CustomResourceDefinitionVersion{
+		Name:   "version",
+		Served: true,
+		Schema: &apiext.CustomResourceValidation{
+			OpenAPIV3Schema: allSchemas["istio.extensions.v1alpha1.WasmPlugin"],
+		},
+	}
+	crd.Spec.Versions = append(crd.Spec.Versions, ver)
 
 	g.buffer.Reset()
 	var filename *string
 	if g.yaml {
-		b, err := yaml.Marshal(o)
+		b, err := yaml.Marshal(crd)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "unable to marshall the output of %v to yaml", name)
 		}
 		filename = proto.String(name + ".yaml")
 		g.buffer.Write(b)
 	} else {
-		b, err := json.MarshalIndent(o, "", "  ")
+		b, err := json.MarshalIndent(crd, "", "  ")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "unable to marshall the output of %v to json", name)
 		}
@@ -358,82 +345,60 @@ func (g *openapiGenerator) generateFile(name string,
 	}
 }
 
-func (g *openapiGenerator) generateMessage(message *protomodel.MessageDescriptor, allSchemas map[string]*openapi3.SchemaRef) {
+func (g *openapiGenerator) generateMessage(message *protomodel.MessageDescriptor, allSchemas map[string]*apiext.JSONSchemaProps) {
 	if o := g.generateMessageSchema(message); o != nil {
-		allSchemas[g.absoluteName(message)] = o.NewRef()
+		allSchemas[g.absoluteName(message)] = o
 	}
 }
 
-func (g *openapiGenerator) generateSoloMessageSchema(message *protomodel.MessageDescriptor, customSchema *openapi3.Schema) *openapi3.Schema {
-	o := customSchema
-	o.Description = g.generateDescription(message)
-
-	return o
-}
-
-func (g *openapiGenerator) generateSoloInt64Schema() *openapi3.Schema {
-	schema := openapi3.NewInt64Schema()
-	schema.ExtensionProps = openapi3.ExtensionProps{
-		Extensions: map[string]interface{}{
-			"x-kubernetes-int-or-string": true,
-		},
+func (g *openapiGenerator) generateSoloInt64Schema() *apiext.JSONSchemaProps {
+	return &apiext.JSONSchemaProps{
+		Type:         "integer",
+		Format:       "int64",
+		XIntOrString: true,
 	}
-
-	return schema
 }
 
-func (g *openapiGenerator) generateMessageSchema(message *protomodel.MessageDescriptor) *openapi3.Schema {
+func (g *openapiGenerator) generateMessageSchema(message *protomodel.MessageDescriptor) *apiext.JSONSchemaProps {
 	// skip MapEntry message because we handle map using the map's repeated field.
 	if message.GetOptions().GetMapEntry() {
 		return nil
 	}
-	o := openapi3.NewObjectSchema()
+	log.Println(message.String())
+	o := &apiext.JSONSchemaProps{
+		Type:       "object",
+		Properties: make(map[string]apiext.JSONSchemaProps),
+	}
 	o.Description = g.generateDescription(message)
 
 	for _, field := range message.Fields {
-		sr := g.fieldTypeRef(field)
-		o.WithProperty(g.fieldName(field), sr.Value)
+		sr := g.fieldType(field)
+		o.Properties[g.fieldName(field)] = *sr
 	}
 
 	return o
 }
 
-func (g *openapiGenerator) generateEnum(enum *protomodel.EnumDescriptor, allSchemas map[string]*openapi3.SchemaRef) {
+func (g *openapiGenerator) generateEnum(enum *protomodel.EnumDescriptor, allSchemas map[string]*apiext.JSONSchemaProps) {
 	o := g.generateEnumSchema(enum)
-	allSchemas[g.absoluteName(enum)] = o.NewRef()
+	allSchemas[g.absoluteName(enum)] = o
 }
 
-func (g *openapiGenerator) generateEnumSchema(enum *protomodel.EnumDescriptor) *openapi3.Schema {
-	/**
-	  The out of the box solution created an enum like:
-	  	enum:
-	  	- - option_a
-	  	  - option_b
-	  	  - option_c
-
-	  Instead, what we want is:
-	  	enum:
-	  	- option_a
-	  	- option_b
-	  	- option_c
-	*/
-	o := openapi3.NewStringSchema()
+func (g *openapiGenerator) generateEnumSchema(enum *protomodel.EnumDescriptor) *apiext.JSONSchemaProps {
+	o := &apiext.JSONSchemaProps{Type: "string"}
 	o.Description = g.generateDescription(enum)
 
 	// If the schema should be int or string, mark it as such
 	if g.enumAsIntOrString {
-		o.ExtensionProps = openapi3.ExtensionProps{
-			Extensions: map[string]interface{}{
-				"x-kubernetes-int-or-string": true,
-			},
-		}
+		o.XIntOrString = true
 		return o
 	}
 
 	// otherwise, return define the expected string values
 	values := enum.GetValue()
 	for _, v := range values {
-		o.Enum = append(o.Enum, v.GetName())
+		b, _ := json.Marshal(v.GetName())
+		o.Enum = append(o.Enum, apiext.JSON{Raw: b})
 	}
 	o.Type = "string"
 
@@ -462,15 +427,16 @@ func (g *openapiGenerator) generateDescription(desc protomodel.CoreDesc) string 
 	return strings.Join(strings.Fields(t), " ")
 }
 
-func (g *openapiGenerator) fieldType(field *protomodel.FieldDescriptor) *openapi3.Schema {
-	var schema *openapi3.Schema
+func (g *openapiGenerator) fieldType(field *protomodel.FieldDescriptor) *apiext.JSONSchemaProps {
+	schema := &apiext.JSONSchemaProps{}
 	var isMap bool
 	switch *field.Type {
 	case descriptor.FieldDescriptorProto_TYPE_FLOAT, descriptor.FieldDescriptorProto_TYPE_DOUBLE:
-		schema = openapi3.NewFloat64Schema()
+		schema.Type = "number"
 
 	case descriptor.FieldDescriptorProto_TYPE_INT32, descriptor.FieldDescriptorProto_TYPE_SINT32, descriptor.FieldDescriptorProto_TYPE_SFIXED32:
-		schema = openapi3.NewInt32Schema()
+		schema.Type = "number"
+		schema.Format = "int32"
 
 	case descriptor.FieldDescriptorProto_TYPE_INT64, descriptor.FieldDescriptorProto_TYPE_SINT64, descriptor.FieldDescriptorProto_TYPE_SFIXED64:
 		schema = g.generateSoloInt64Schema()
@@ -479,36 +445,30 @@ func (g *openapiGenerator) fieldType(field *protomodel.FieldDescriptor) *openapi
 		schema = g.generateSoloInt64Schema()
 
 	case descriptor.FieldDescriptorProto_TYPE_UINT32, descriptor.FieldDescriptorProto_TYPE_FIXED32:
-		schema = openapi3.NewInt32Schema()
+		schema.Type = "number"
+		schema.Format = "int32"
 
 	case descriptor.FieldDescriptorProto_TYPE_BOOL:
-		schema = openapi3.NewBoolSchema()
+		schema.Type = "boolean"
 
 	case descriptor.FieldDescriptorProto_TYPE_STRING:
-		schema = openapi3.NewStringSchema()
+		schema.Type = "string"
 
 	case descriptor.FieldDescriptorProto_TYPE_MESSAGE:
 		msg := field.FieldType.(*protomodel.MessageDescriptor)
-		if soloSchema, ok := g.customSchemasByMessageName[g.absoluteName(msg)]; ok {
-			// Allow for defining special Solo types
-			schema = g.generateSoloMessageSchema(msg, &soloSchema)
-		} else if msg.GetOptions().GetMapEntry() {
+		if msg.GetOptions().GetMapEntry() {
 			isMap = true
-			sr := g.fieldTypeRef(msg.Fields[1])
-			if g.useRef && sr.Ref != "" {
-				schema = openapi3.NewObjectSchema()
-				// in `$ref`, the value of the schema is not in the output.
-				sr.Value = nil
-				schema.AdditionalProperties = sr
-			} else {
-				schema = openapi3.NewObjectSchema().WithAdditionalProperties(sr.Value)
-			}
+			sr := g.fieldType(msg.Fields[1])
+			//schema.Type = "object"
+			schema = sr
+
 		} else {
 			schema = g.generateMessageSchema(msg)
 		}
 
 	case descriptor.FieldDescriptorProto_TYPE_BYTES:
-		schema = openapi3.NewBytesSchema()
+		schema.Type = "string"
+		schema.Format = "byte"
 
 	case descriptor.FieldDescriptorProto_TYPE_ENUM:
 		enum := field.FieldType.(*protomodel.EnumDescriptor)
@@ -516,7 +476,9 @@ func (g *openapiGenerator) fieldType(field *protomodel.FieldDescriptor) *openapi
 	}
 
 	if field.IsRepeated() && !isMap {
-		schema = openapi3.NewArraySchema().WithItems(schema)
+		schema.Format = "array"
+		// TODO?
+		schema.Items = &apiext.JSONSchemaPropsOrArray{Schema: schema}
 	}
 
 	if schema != nil {
@@ -524,20 +486,6 @@ func (g *openapiGenerator) fieldType(field *protomodel.FieldDescriptor) *openapi
 	}
 
 	return schema
-}
-
-// fieldTypeRef generates the `$ref` in addition to the schema for a field.
-func (g *openapiGenerator) fieldTypeRef(field *protomodel.FieldDescriptor) *openapi3.SchemaRef {
-	s := g.fieldType(field)
-	var ref string
-	if *field.Type == descriptor.FieldDescriptorProto_TYPE_MESSAGE {
-		msg := field.FieldType.(*protomodel.MessageDescriptor)
-		// only generate `$ref` for top level messages.
-		if _, ok := g.messages[g.relativeName(field.FieldType)]; ok && msg.Parent == nil {
-			ref = fmt.Sprintf("#/components/schemas/%v", g.absoluteName(field.FieldType))
-		}
-	}
-	return openapi3.NewSchemaRef(ref, s)
 }
 
 func (g *openapiGenerator) fieldName(field *protomodel.FieldDescriptor) string {
@@ -551,4 +499,8 @@ func (g *openapiGenerator) relativeName(desc protomodel.CoreDesc) string {
 	}
 
 	return desc.PackageDesc().Name + "." + typeName
+}
+
+func Ptr[T any](t T) *T {
+	return &t
 }
