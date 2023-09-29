@@ -531,9 +531,26 @@ func (g *openapiGenerator) generateMessageSchema(message *protomodel.MessageDesc
 	}
 	o.Description = g.generateDescription(message)
 
+	oneOfs := make([]apiext.JSONSchemaProps, len(message.OneofDecl))
 	for _, field := range message.Fields {
+		fn := g.fieldName(field)
+		if field.OneofIndex != nil {
+			log.Println(fn, *message.Name, message.OneofDecl)
+			oneOfs[*field.OneofIndex].OneOf = append(oneOfs[*field.OneofIndex].OneOf, apiext.JSONSchemaProps{Required: []string{fn}})
+		}
 		sr := g.fieldType(field)
-		o.Properties[g.fieldName(field)] = *sr
+		o.Properties[fn] = *sr
+	}
+	for i, oo := range oneOfs {
+		oo.OneOf = append([]apiext.JSONSchemaProps{{Not: &apiext.JSONSchemaProps{AnyOf: oo.OneOf}}}, oo.OneOf...)
+		oneOfs[i] = oo
+	}
+	switch len(oneOfs) {
+	case 0:
+	case 1:
+		o.OneOf = oneOfs[0].OneOf
+	default:
+		o.AllOf = oneOfs
 	}
 
 	return o
