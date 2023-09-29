@@ -17,12 +17,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"log"
-	"math"
-	"os"
-	"path"
+	"slices"
+	"sort"
 	"strings"
 
 	"github.com/solo-io/protoc-gen-openapi/pkg/protomodel"
@@ -40,56 +38,80 @@ import (
 // This is to catch cases where solo apis contain recursive definitions
 // Normally these would result in stack-overflow errors when generating the open api schema
 // The imperfect solution, is to just generate an empty object for these types
-var specialSoloTypes = map[string]openapi3.Schema{
+var specialSoloTypes = map[string]*apiext.JSONSchemaProps{
 	"core.solo.io.Metadata": {
 		Type: openapi3.TypeObject,
 	},
-	"google.protobuf.ListValue": *openapi3.NewArraySchema().WithItems(openapi3.NewObjectSchema()),
+	"google.protobuf.ListValue": {
+		Items: &apiext.JSONSchemaPropsOrArray{Schema: &apiext.JSONSchemaProps{Type: "object"}},
+	},
 	"google.protobuf.Struct": {
-		Type:       openapi3.TypeObject,
-		Properties: make(map[string]*openapi3.SchemaRef),
-		ExtensionProps: openapi3.ExtensionProps{
-			Extensions: map[string]interface{}{
-				"x-kubernetes-preserve-unknown-fields": true,
-			},
-		},
+		Type:                   openapi3.TypeObject,
+		XPreserveUnknownFields: Ptr(true),
 	},
 	"google.protobuf.Any": {
-		Type:       openapi3.TypeObject,
-		Properties: make(map[string]*openapi3.SchemaRef),
-		ExtensionProps: openapi3.ExtensionProps{
-			Extensions: map[string]interface{}{
-				"x-kubernetes-preserve-unknown-fields": true,
-			},
-		},
+		Type:                   openapi3.TypeObject,
+		XPreserveUnknownFields: Ptr(true),
 	},
 	"google.protobuf.Value": {
-		Properties: make(map[string]*openapi3.SchemaRef),
-		ExtensionProps: openapi3.ExtensionProps{
-			Extensions: map[string]interface{}{
-				"x-kubernetes-preserve-unknown-fields": true,
-			},
-		},
+		XPreserveUnknownFields: Ptr(true),
 	},
-	"google.protobuf.BoolValue":   *openapi3.NewBoolSchema().WithNullable(),
-	"google.protobuf.StringValue": *openapi3.NewStringSchema().WithNullable(),
-	"google.protobuf.DoubleValue": *openapi3.NewFloat64Schema().WithNullable(),
-	"google.protobuf.Int32Value":  *openapi3.NewIntegerSchema().WithNullable().WithMin(math.MinInt32).WithMax(math.MaxInt32),
-	"google.protobuf.Int64Value":  *openapi3.NewIntegerSchema().WithNullable().WithMin(math.MinInt64).WithMax(math.MaxInt64),
-	"google.protobuf.UInt32Value": *openapi3.NewIntegerSchema().WithNullable().WithMin(0).WithMax(math.MaxUint32),
-	"google.protobuf.UInt64Value": *openapi3.NewIntegerSchema().WithNullable().WithMin(0).WithMax(math.MaxUint64),
-	"google.protobuf.FloatValue":  *openapi3.NewFloat64Schema().WithNullable(),
-	"google.protobuf.Duration":    *openapi3.NewStringSchema(),
-	"google.protobuf.Empty":       *openapi3.NewObjectSchema().WithMaxProperties(0),
-	"google.protobuf.Timestamp":   *openapi3.NewStringSchema().WithFormat("date-time"),
+	"google.protobuf.BoolValue": {
+		Type:     "boolean",
+		Nullable: true,
+	},
+	"google.protobuf.StringValue": {
+		Type:     "string",
+		Nullable: true,
+	},
+	"google.protobuf.DoubleValue": {
+		Type:     "number",
+		Nullable: true,
+	},
+	"google.protobuf.Int32Value": {
+		Type:     "integer",
+		Nullable: true,
+		//Min: math.MinInt32,
+		//Max: math.MaxInt32,
+	},
+	"google.protobuf.Int64Value": {
+		Type:     "integer",
+		Nullable: true,
+		//Min: math.MinInt64,
+		//Max: math.MaxInt64,
+	},
+	"google.protobuf.UInt32Value": {
+		Type:     "integer",
+		Nullable: true,
+		//Min: 0,
+		//Max: math.MaxUInt32,
+	},
+	"google.protobuf.UInt64Value": {
+		Type:     "integer",
+		Nullable: true,
+		//Min: 0,
+		//Max: math.MaxUInt62,
+	},
+	"google.protobuf.FloatValue": {
+		Type:     "number",
+		Nullable: true,
+	},
+	"google.protobuf.Duration": {
+		Type:     "string",
+		Nullable: true,
+	},
+	"google.protobuf.Empty": {
+		Type:          "object",
+		MaxProperties: Ptr(int64(0)),
+	},
+	"google.protobuf.Timestamp": {
+		Type:   "string",
+		Format: "date-time",
+	},
 }
 
 type openapiGenerator struct {
-	buffer     bytes.Buffer
-	model      *protomodel.Model
-	perFile    bool
-	singleFile bool
-	yaml       bool
+	model *protomodel.Model
 
 	// transient state as individual files are processed
 	currentPackage             *protomodel.PackageDescriptor
@@ -103,6 +125,9 @@ type openapiGenerator struct {
 	// @solo.io customization to support enum validation schemas with int or string values
 	// we need to support this since some controllers marshal enums as integers and others as strings
 	enumAsIntOrString bool
+
+	// @solo.io customizations to define schemas for certain messages
+	customSchemasByMessageName map[string]*apiext.JSONSchemaProps
 }
 
 type DescriptionConfiguration struct {
@@ -112,56 +137,42 @@ type DescriptionConfiguration struct {
 
 func newOpenAPIGenerator(
 	model *protomodel.Model,
-	perFile bool,
-	singleFile bool,
-	yaml bool,
 	descriptionConfiguration *DescriptionConfiguration,
 	enumAsIntOrString bool,
 ) *openapiGenerator {
 	return &openapiGenerator{
-		model:                    model,
-		perFile:                  perFile,
-		singleFile:               singleFile,
-		yaml:                     yaml,
-		descriptionConfiguration: descriptionConfiguration,
-		enumAsIntOrString:        enumAsIntOrString,
+		model:                      model,
+		descriptionConfiguration:   descriptionConfiguration,
+		enumAsIntOrString:          enumAsIntOrString,
+		customSchemasByMessageName: buildCustomSchemasByMessageName(),
 	}
+}
+
+// buildCustomSchemasByMessageName name returns a mapping of message name to a pre-defined openapi schema
+// It includes:
+//  1. `specialSoloTypes`, a set of pre-defined schemas
+func buildCustomSchemasByMessageName() map[string]*apiext.JSONSchemaProps {
+	schemasByMessageName := make(map[string]*apiext.JSONSchemaProps)
+
+	// Initialize the hard-coded values
+	for name, schema := range specialSoloTypes {
+		schemasByMessageName[name] = schema
+	}
+
+	return schemasByMessageName
 }
 
 func (g *openapiGenerator) generateOutput(filesToGen map[*protomodel.FileDescriptor]bool) (*plugin.CodeGeneratorResponse, error) {
 	response := plugin.CodeGeneratorResponse{}
 
-	if g.singleFile {
-		g.generateSingleFileOutput(filesToGen, &response)
-	} else {
-		for _, pkg := range g.model.Packages {
-			g.currentPackage = pkg
-
-			// anything to output for this package?
-			count := 0
-			for _, file := range pkg.Files {
-				if _, ok := filesToGen[file]; ok {
-					count++
-				}
-			}
-
-			if count > 0 {
-				if g.perFile {
-					g.generatePerFileOutput(filesToGen, pkg, &response)
-				} else {
-					g.generatePerPackageOutput(filesToGen, pkg, &response)
-				}
-			}
-		}
-	}
+	g.generateSingleFileOutput(filesToGen, &response)
 
 	return &response, nil
 }
 
 func (g *openapiGenerator) getFileContents(file *protomodel.FileDescriptor,
 	messages map[string]*protomodel.MessageDescriptor,
-	enums map[string]*protomodel.EnumDescriptor,
-	services map[string]*protomodel.ServiceDescriptor) {
+	enums map[string]*protomodel.EnumDescriptor) {
 	for _, m := range file.AllMessages {
 		messages[g.relativeName(m)] = m
 	}
@@ -169,89 +180,109 @@ func (g *openapiGenerator) getFileContents(file *protomodel.FileDescriptor,
 	for _, e := range file.AllEnums {
 		enums[g.relativeName(e)] = e
 	}
-
-	for _, s := range file.Services {
-		services[g.relativeName(s)] = s
-	}
-}
-
-func (g *openapiGenerator) generatePerFileOutput(filesToGen map[*protomodel.FileDescriptor]bool, pkg *protomodel.PackageDescriptor,
-	response *plugin.CodeGeneratorResponse) {
-
-	for _, file := range pkg.Files {
-		if _, ok := filesToGen[file]; ok {
-			g.currentFrontMatterProvider = file
-			messages := make(map[string]*protomodel.MessageDescriptor)
-			enums := make(map[string]*protomodel.EnumDescriptor)
-			services := make(map[string]*protomodel.ServiceDescriptor)
-
-			g.getFileContents(file, messages, enums, services)
-			filename := path.Base(file.GetName())
-			extension := path.Ext(filename)
-			name := filename[0 : len(filename)-len(extension)]
-
-			rf := g.generateFile(name, file, messages, enums, services)
-			response.File = append(response.File, &rf)
-		}
-	}
-
 }
 
 func (g *openapiGenerator) generateSingleFileOutput(filesToGen map[*protomodel.FileDescriptor]bool, response *plugin.CodeGeneratorResponse) {
 	messages := make(map[string]*protomodel.MessageDescriptor)
 	enums := make(map[string]*protomodel.EnumDescriptor)
-	services := make(map[string]*protomodel.ServiceDescriptor)
 
 	for file, ok := range filesToGen {
 		if ok {
-			g.getFileContents(file, messages, enums, services)
+			g.getFileContents(file, messages, enums)
 		}
 	}
 
-	rf := g.generateFile("openapiv3", &protomodel.FileDescriptor{}, messages, enums, services)
+	rf := g.generateFile("openapiv3", messages, enums)
 	response.File = []*plugin.CodeGeneratorResponse_File{&rf}
 }
 
-func (g *openapiGenerator) generatePerPackageOutput(filesToGen map[*protomodel.FileDescriptor]bool, pkg *protomodel.PackageDescriptor,
-	response *plugin.CodeGeneratorResponse) {
-	// We need to produce a file for this package.
+const (
+	enableCRDGenTag = "+cue-gen"
+)
 
-	// Decide which types need to be included in the generated file.
-	// This will be all the types in the fileToGen input files, along with any
-	// dependent types which are located in packages that don't have
-	// a known location on the web.
-	messages := make(map[string]*protomodel.MessageDescriptor)
-	enums := make(map[string]*protomodel.EnumDescriptor)
-	services := make(map[string]*protomodel.ServiceDescriptor)
+func cleanComments(lines []string) []string {
+	out := []string{}
+	var prevLine string
+	for _, line := range lines {
+		line = strings.Trim(line, " ")
 
-	g.currentFrontMatterProvider = pkg.FileDesc()
-
-	for _, file := range pkg.Files {
-		if _, ok := filesToGen[file]; ok {
-			g.getFileContents(file, messages, enums, services)
+		if line == "-->" {
+			out = append(out, prevLine)
+			prevLine = ""
+			continue
 		}
-	}
 
-	rf := g.generateFile(pkg.Name, pkg.FileDesc(), messages, enums, services)
-	response.File = append(response.File, &rf)
+		if !strings.HasPrefix(line, enableCRDGenTag) {
+			if prevLine != "" && len(line) != 0 {
+				prevLine += " " + line
+			}
+			continue
+		}
+
+		out = append(out, prevLine)
+
+		prevLine = line
+
+	}
+	if prevLine != "" {
+		out = append(out, prevLine)
+	}
+	return out
+}
+func parseGenTags(s string) map[string]string {
+	lines := cleanComments(strings.Split(s, "\n"))
+	res := map[string]string{}
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		_, contents, f := strings.Cut(line, enableCRDGenTag)
+		if !f {
+			continue
+		}
+		//res[contents] = ""
+		//continue
+		spl := strings.SplitN(contents[1:], ":", 3)
+		if len(spl) < 2 {
+			log.Fatalf("invalid tag: %v", line)
+		}
+		val := ""
+		if len(spl) > 2 {
+			val = spl[2]
+		}
+		res[spl[1]] = val
+	}
+	if len(res) == 0 {
+		return nil
+	}
+	return res
 }
 
 // Generate an OpenAPI spec for a collection of cross-linked files.
 func (g *openapiGenerator) generateFile(name string,
-	pkg *protomodel.FileDescriptor,
 	messages map[string]*protomodel.MessageDescriptor,
-	enums map[string]*protomodel.EnumDescriptor,
-	_ map[string]*protomodel.ServiceDescriptor) plugin.CodeGeneratorResponse_File {
+	enums map[string]*protomodel.EnumDescriptor) plugin.CodeGeneratorResponse_File {
 
 	g.messages = messages
 
 	allSchemas := make(map[string]*apiext.JSONSchemaProps)
+
+	// Type --> Key --> Value
+	genTags := map[string]map[string]string{}
 
 	for _, message := range messages {
 		// we generate the top-level messages here and the nested messages are generated
 		// inside each top-level message.
 		if message.Parent == nil {
 			g.generateMessage(message, allSchemas)
+		}
+		if gt := parseGenTags(message.Location().GetLeadingComments()); gt != nil {
+			genTags[g.absoluteName(message)] = gt
+		}
+	}
+	for k, kv := range genTags {
+		for kk, vv := range kv {
+			log.Printf("%q %q %q", k, kk, vv)
 		}
 	}
 
@@ -262,87 +293,210 @@ func (g *openapiGenerator) generateFile(name string,
 		}
 	}
 
-	// only get the API version when generate per package or per file,
-	// as we cannot guarantee all protos in the input are the same version.
-	//if !g.singleFile {
-	//	if g.currentFrontMatterProvider != nil && g.currentFrontMatterProvider.Matter.Description != "" {
-	//		description = g.currentFrontMatterProvider.Matter.Description
-	//	} else if pd := g.generateDescription(g.currentPackage); pd != "" {
-	//		description = pd
-	//	} else {
-	//		description = "OpenAPI Spec for Solo APIs."
-	//	}
-	//	// derive the API version from the package name
-	//	// which is a convention for Istio APIs.
-	//	var p string
-	//	if pkg != nil {
-	//		p = pkg.GetPackage()
-	//	} else {
-	//		p = name
-	//	}
-	//	s := strings.Split(p, ".")
-	//	version = s[len(s)-1]
-	//} else {
-	//	description = "OpenAPI Spec for Solo APIs."
-	//}
+	crds := []*apiext.CustomResourceDefinition{}
 
-	// add the openapi object required by the spec.
-
-	groupKind := schema.GroupKind{
-		Group: "group",
-		Kind:  "kind",
-	}
-
-	crd := apiext.CustomResourceDefinition{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "apiextensions.k8s.io/v1",
-			Kind:       "CustomResourceDefinition",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "plural" + "." + groupKind.Group,
-		},
-		Spec: apiext.CustomResourceDefinitionSpec{
-			Group: groupKind.Group,
-			Names: apiext.CustomResourceDefinitionNames{
-				Kind:     groupKind.Kind,
-				ListKind: groupKind.Kind + "List",
-				Plural:   "plural",
-				Singular: strings.ToLower(groupKind.Kind),
+	for name, cfg := range genTags {
+		_ = cfg
+		_ = name
+		log.Println("Generating", name)
+		group := cfg["groupName"]
+		version := cfg["version"]
+		kind := name[strings.LastIndex(name, ".")+1:]
+		singular := strings.ToLower(kind)
+		plural := singular + "s"
+		schema := &apiext.JSONSchemaProps{
+			Type: "object",
+			Properties: map[string]apiext.JSONSchemaProps{
+				"spec": *allSchemas[name],
+				"status": {
+					Type:                   "object",
+					XPreserveUnknownFields: Ptr(true),
+				},
 			},
-			Scope: apiext.NamespaceScoped,
-		},
-	}
-	ver := apiext.CustomResourceDefinitionVersion{
-		Name:   "version",
-		Served: true,
-		Schema: &apiext.CustomResourceValidation{
-			OpenAPIV3Schema: allSchemas["istio.extensions.v1alpha1.WasmPlugin"],
-		},
-	}
-	crd.Spec.Versions = append(crd.Spec.Versions, ver)
+		}
+		crd := &apiext.CustomResourceDefinition{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "apiextensions.k8s.io/v1",
+				Kind:       "CustomResourceDefinition",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: extractKV(cfg["annotations"]),
+				Labels:      extractKV(cfg["labels"]),
+			},
+			Spec: apiext.CustomResourceDefinitionSpec{
+				Group: group,
+				Names: apiext.CustomResourceDefinitionNames{
+					Kind:     kind,
+					ListKind: kind + "List",
+					Plural:   plural,
+					Singular: singular,
+				},
+				Scope: apiext.NamespaceScoped,
+			},
+			Status: apiext.CustomResourceDefinitionStatus{},
+		}
+		ver := apiext.CustomResourceDefinitionVersion{
+			Name:   version,
+			Served: true,
+			Schema: &apiext.CustomResourceValidation{
+				OpenAPIV3Schema: schema,
+			},
+		}
 
-	g.buffer.Reset()
-	var filename *string
-	if g.yaml {
+		if res, f := cfg["resource"]; f {
+			for n, m := range extractKV(res) {
+				log.Println(n, m)
+				switch n {
+				case "categories":
+					crd.Spec.Names.Categories = mergeSlices(crd.Spec.Names.Categories, strings.Split(m, ","))
+				case "plural":
+					crd.Spec.Names.Plural = m
+				case "kind":
+					crd.Spec.Names.Kind = m
+				case "shortNames":
+					crd.Spec.Names.ShortNames = mergeSlices(crd.Spec.Names.ShortNames, strings.Split(m, ","))
+				case "singular":
+					crd.Spec.Names.Singular = m
+				case "listKind":
+					crd.Spec.Names.ListKind = m
+				}
+			}
+		}
+		crd.Name = crd.Spec.Names.Plural + "." + group
+		if pk, f := cfg["printerColumn"]; f {
+			pcs := strings.Split(pk, ";;")
+			for _, pc := range pcs {
+				if pc == "" {
+					continue
+				}
+				column := apiext.CustomResourceColumnDefinition{}
+				for n, m := range extractKeyValue(pc) {
+					switch n {
+					case "name":
+						column.Name = m
+					case "type":
+						column.Type = m
+					case "description":
+						column.Description = m
+					case "JSONPath":
+						column.JSONPath = m
+					}
+				}
+				ver.AdditionalPrinterColumns = append(ver.AdditionalPrinterColumns, column)
+			}
+		}
+		if sr, f := cfg["subresource"]; f {
+			if sr == "status" {
+				ver.Subresources = &apiext.CustomResourceSubresources{Status: &apiext.CustomResourceSubresourceStatus{}}
+			}
+		}
+		if _, f := cfg["storageVersion"]; f {
+			ver.Storage = true
+		}
+		crd.Spec.Versions = append(crd.Spec.Versions, ver)
+		crds = append(crds, crd)
+	}
+
+	slices.SortFunc(crds, func(a, b *apiext.CustomResourceDefinition) int {
+		if a.Name < b.Name {
+			return 1
+		} else {
+			return -1
+		}
+	})
+	bb := &bytes.Buffer{}
+	bb.WriteString("# DO NOT EDIT - Generated by Cue OpenAPI generator based on Istio APIs.\n")
+	for i, crd := range crds {
 		b, err := yaml.Marshal(crd)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "unable to marshall the output of %v to yaml", name)
+			log.Fatalf("unable to marshall the output of %v to yaml", name)
 		}
-		filename = proto.String(name + ".yaml")
-		g.buffer.Write(b)
-	} else {
-		b, err := json.MarshalIndent(crd, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "unable to marshall the output of %v to json", name)
+		b = fixupYaml(b)
+		bb.Write(b)
+		if i != len(crds)-1 {
+			bb.WriteString("---\n")
 		}
-		filename = proto.String(name + ".json")
-		g.buffer.Write(b)
 	}
 
 	return plugin.CodeGeneratorResponse_File{
-		Name:    filename,
-		Content: proto.String(g.buffer.String()),
+		Name:    proto.String(name + ".yaml"),
+		Content: proto.String(bb.String()),
 	}
+}
+
+func mergeSlices(a []string, b []string) []string {
+	nv := sets.New(a...).Insert(b...).UnsortedList()
+	sort.Strings(nv)
+	return nv
+}
+
+func extractKV(s string) map[string]string {
+	return extractKeyValue(s)
+	res := map[string]string{}
+	for _, i := range strings.Split(s, ",") {
+		k, v, _ := strings.Cut(i, "=")
+		res[k] = v
+	}
+	return res
+}
+
+// extractkeyValue extracts a string to key value pairs
+// e.g. a=b,b=c to map[a:b b:c]
+// and a=b,c,d,e=f to map[a:b,c,d e:f]
+func extractKeyValue(s string) map[string]string {
+	out := map[string]string{}
+	if s == "" {
+		return out
+	}
+	splits := strings.Split(s, "=")
+	if len(splits) == 1 {
+		out[splits[0]] = ""
+	}
+	if strings.Contains(splits[0], ",") {
+		log.Fatalf("cannot parse %v to key value pairs", s)
+	}
+	nextkey := splits[0]
+	for i := 1; i < len(splits); i++ {
+		if splits[i] == "" || splits[i] == "," {
+			log.Fatalf("cannot parse %v to key value paris, invalid value", s)
+		}
+		if !strings.Contains(splits[i], ",") && i != len(splits)-1 {
+			log.Fatalf("cannot parse %v to key value pairs, missing separator", s)
+		}
+		if i == len(splits)-1 {
+			out[nextkey] = strings.Trim(splits[i], "\"'`")
+			continue
+		}
+		index := strings.LastIndex(splits[i], ",")
+		out[nextkey] = strings.Trim(splits[i][:index], "\"'`")
+		nextkey = splits[i][index+1:]
+		if nextkey == "" {
+			log.Fatalf("cannot parse %v to key value pairs, missing key", s)
+		}
+	}
+	return out
+}
+
+const (
+	statusOutput = `
+status:
+  acceptedNames:
+    kind: ""
+    plural: ""
+  conditions: null
+  storedVersions: null`
+
+	creationTimestampOutput = `
+  creationTimestamp: null`
+)
+
+func fixupYaml(y []byte) []byte {
+	// remove the status and creationTimestamp fields from the output. Ideally we could use OrderedMap to remove those.
+	y = bytes.ReplaceAll(y, []byte(statusOutput), []byte(""))
+	y = bytes.ReplaceAll(y, []byte(creationTimestampOutput), []byte(""))
+	// keep the quotes in the output which is required by helm.
+	y = bytes.ReplaceAll(y, []byte("helm.sh/resource-policy: keep"), []byte(`"helm.sh/resource-policy": keep`))
+	return y
 }
 
 func (g *openapiGenerator) generateMessage(message *protomodel.MessageDescriptor, allSchemas map[string]*apiext.JSONSchemaProps) {
@@ -359,12 +513,18 @@ func (g *openapiGenerator) generateSoloInt64Schema() *apiext.JSONSchemaProps {
 	}
 }
 
+func (g *openapiGenerator) generateCustomMessageSchema(message *protomodel.MessageDescriptor, customSchema *apiext.JSONSchemaProps) *apiext.JSONSchemaProps {
+	o := customSchema
+	o.Description = g.generateDescription(message)
+
+	return o
+}
+
 func (g *openapiGenerator) generateMessageSchema(message *protomodel.MessageDescriptor) *apiext.JSONSchemaProps {
 	// skip MapEntry message because we handle map using the map's repeated field.
 	if message.GetOptions().GetMapEntry() {
 		return nil
 	}
-	log.Println(message.String())
 	o := &apiext.JSONSchemaProps{
 		Type:       "object",
 		Properties: make(map[string]apiext.JSONSchemaProps),
@@ -386,7 +546,8 @@ func (g *openapiGenerator) generateEnum(enum *protomodel.EnumDescriptor, allSche
 
 func (g *openapiGenerator) generateEnumSchema(enum *protomodel.EnumDescriptor) *apiext.JSONSchemaProps {
 	o := &apiext.JSONSchemaProps{Type: "string"}
-	o.Description = g.generateDescription(enum)
+	// Enum description is not used in Kubernetes
+	//o.Description = g.generateDescription(enum)
 
 	// If the schema should be int or string, mark it as such
 	if g.enumAsIntOrString {
@@ -418,12 +579,21 @@ func (g *openapiGenerator) generateDescription(desc protomodel.CoreDesc) string 
 	}
 
 	c := strings.TrimSpace(desc.Location().GetLeadingComments())
-	t := strings.Split(c, "\n\n")[0]
-	// omit the comment that starts with `$`.
-	if strings.HasPrefix(t, "$") {
+	if strings.Contains(c, "$hide_from_docs") {
 		return ""
 	}
+	t := strings.Split(c, "\n\n")[0]
+	//return strings.Split(t, "\n")[0]
+	//// omit the comment that starts with `$`.
+	//if strings.HasPrefix(t, "$") {
+	//	return ""
+	//}
 
+	idx := strings.Index(t, ".")
+	if idx == -1 {
+		return t
+	}
+	return t[:idx+1]
 	return strings.Join(strings.Fields(t), " ")
 }
 
@@ -433,56 +603,73 @@ func (g *openapiGenerator) fieldType(field *protomodel.FieldDescriptor) *apiext.
 	switch *field.Type {
 	case descriptor.FieldDescriptorProto_TYPE_FLOAT, descriptor.FieldDescriptorProto_TYPE_DOUBLE:
 		schema.Type = "number"
+		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_INT32, descriptor.FieldDescriptorProto_TYPE_SINT32, descriptor.FieldDescriptorProto_TYPE_SFIXED32:
-		schema.Type = "number"
-		schema.Format = "int32"
+		schema.Type = "integer"
+		//schema.Format = "int32"
+		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_INT64, descriptor.FieldDescriptorProto_TYPE_SINT64, descriptor.FieldDescriptorProto_TYPE_SFIXED64:
 		schema = g.generateSoloInt64Schema()
+		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_UINT64, descriptor.FieldDescriptorProto_TYPE_FIXED64:
 		schema = g.generateSoloInt64Schema()
+		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_UINT32, descriptor.FieldDescriptorProto_TYPE_FIXED32:
-		schema.Type = "number"
-		schema.Format = "int32"
+		schema.Type = "integer"
+		//schema.Format = "int32"
+		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_BOOL:
 		schema.Type = "boolean"
+		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_STRING:
 		schema.Type = "string"
+		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_MESSAGE:
 		msg := field.FieldType.(*protomodel.MessageDescriptor)
-		if msg.GetOptions().GetMapEntry() {
+		if customSchema, ok := g.customSchemasByMessageName[g.absoluteName(msg)]; ok {
+			schema = g.generateCustomMessageSchema(msg, customSchema)
+		} else if msg.GetOptions().GetMapEntry() {
 			isMap = true
 			sr := g.fieldType(msg.Fields[1])
 			//schema.Type = "object"
 			schema = sr
+			schema = &apiext.JSONSchemaProps{
+				//Format: "array",
+				Type:                 "object",
+				AdditionalProperties: &apiext.JSONSchemaPropsOrBool{Schema: schema},
+			}
 
 		} else {
 			schema = g.generateMessageSchema(msg)
 		}
+		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_BYTES:
 		schema.Type = "string"
 		schema.Format = "byte"
+		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_ENUM:
 		enum := field.FieldType.(*protomodel.EnumDescriptor)
 		schema = g.generateEnumSchema(enum)
+		schema.Description = g.generateDescription(field)
 	}
 
 	if field.IsRepeated() && !isMap {
-		schema.Format = "array"
-		// TODO?
-		schema.Items = &apiext.JSONSchemaPropsOrArray{Schema: schema}
-	}
-
-	if schema != nil {
-		schema.Description = g.generateDescription(field)
+		schema = &apiext.JSONSchemaProps{
+			//Format: "array",
+			Type:  "array",
+			Items: &apiext.JSONSchemaPropsOrArray{Schema: schema},
+		}
+		schema.Description = schema.Items.Schema.Description
+		schema.Items.Schema.Description = ""
 	}
 
 	return schema

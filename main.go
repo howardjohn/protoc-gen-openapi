@@ -44,38 +44,12 @@ func extractParams(parameter string) map[string]string {
 }
 
 func generate(request plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorResponse, error) {
-	perFile := false
-	singleFile := false
-	yaml := false
 	includeDescription := true
 	enumAsIntOrString := false
 
 	p := extractParams(request.GetParameter())
 	for k, v := range p {
-		if k == "per_file" {
-			switch strings.ToLower(v) {
-			case "true":
-				perFile = true
-			case "false":
-				perFile = false
-			default:
-				return nil, fmt.Errorf("unknown value '%s' for per_file", v)
-			}
-		} else if k == "single_file" {
-			switch strings.ToLower(v) {
-			case "true":
-				if perFile {
-					return nil, fmt.Errorf("output is already to be generated per file, cannot output to a single file")
-				}
-				singleFile = true
-			case "false":
-				singleFile = false
-			default:
-				return nil, fmt.Errorf("unknown value '%s' for single_file", v)
-			}
-		} else if k == "yaml" {
-			yaml = true
-		} else if k == "include_description" {
+		if k == "include_description" {
 			switch strings.ToLower(v) {
 			case "true":
 				includeDescription = true
@@ -94,11 +68,11 @@ func generate(request plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorRespons
 				return nil, fmt.Errorf("unknown value '%s' for enum_as_int_or_string", v)
 			}
 		} else {
-			return nil, fmt.Errorf("unknown argument '%s' specified", k)
+			//return nil, fmt.Errorf("unknown argument '%s' specified", k)
 		}
 	}
 
-	m := protomodel.NewModel(&request, perFile)
+	m := protomodel.NewModel(&request, false)
 
 	filesToGen := make(map[*protomodel.FileDescriptor]bool)
 	for _, fileName := range request.FileToGenerate {
@@ -115,9 +89,6 @@ func generate(request plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorRespons
 
 	g := newOpenAPIGenerator(
 		m,
-		perFile,
-		singleFile,
-		yaml,
 		descriptionConfiguration,
 		enumAsIntOrString)
 	return g.generateOutput(filesToGen)
