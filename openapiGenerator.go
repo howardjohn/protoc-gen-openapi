@@ -17,6 +17,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"log"
 	"slices"
@@ -170,9 +171,12 @@ func (g *openapiGenerator) generateOutput(filesToGen map[*protomodel.FileDescrip
 	return &response, nil
 }
 
-func (g *openapiGenerator) getFileContents(file *protomodel.FileDescriptor,
+func (g *openapiGenerator) getFileContents(
+	file *protomodel.FileDescriptor,
 	messages map[string]*protomodel.MessageDescriptor,
-	enums map[string]*protomodel.EnumDescriptor) {
+	enums map[string]*protomodel.EnumDescriptor,
+	descriptions map[string]string,
+) {
 	for _, m := range file.AllMessages {
 		messages[g.relativeName(m)] = m
 	}
@@ -180,19 +184,25 @@ func (g *openapiGenerator) getFileContents(file *protomodel.FileDescriptor,
 	for _, e := range file.AllEnums {
 		enums[g.relativeName(e)] = e
 	}
+	for _, v := range file.Matter.Extra {
+		if _, n, f := strings.Cut(v, "schema: "); f {
+			descriptions[n] = fmt.Sprintf("%v See more details at: %v", file.Matter.Description, file.Matter.HomeLocation)
+		}
+	}
 }
 
 func (g *openapiGenerator) generateSingleFileOutput(filesToGen map[*protomodel.FileDescriptor]bool, response *plugin.CodeGeneratorResponse) {
 	messages := make(map[string]*protomodel.MessageDescriptor)
 	enums := make(map[string]*protomodel.EnumDescriptor)
+	descriptions := make(map[string]string)
 
 	for file, ok := range filesToGen {
 		if ok {
-			g.getFileContents(file, messages, enums)
+			g.getFileContents(file, messages, enums, descriptions)
 		}
 	}
 
-	rf := g.generateFile("openapiv3", messages, enums)
+	rf := g.generateFile("openapiv3", messages, enums, descriptions)
 	response.File = []*plugin.CodeGeneratorResponse_File{&rf}
 }
 
@@ -259,9 +269,7 @@ func parseGenTags(s string) map[string]string {
 }
 
 // Generate an OpenAPI spec for a collection of cross-linked files.
-func (g *openapiGenerator) generateFile(name string,
-	messages map[string]*protomodel.MessageDescriptor,
-	enums map[string]*protomodel.EnumDescriptor) plugin.CodeGeneratorResponse_File {
+func (g *openapiGenerator) generateFile(name string, messages map[string]*protomodel.MessageDescriptor, enums map[string]*protomodel.EnumDescriptor, descriptions map[string]string) plugin.CodeGeneratorResponse_File {
 
 	g.messages = messages
 
@@ -296,18 +304,20 @@ func (g *openapiGenerator) generateFile(name string,
 	crds := []*apiext.CustomResourceDefinition{}
 
 	for name, cfg := range genTags {
-		_ = cfg
-		_ = name
 		log.Println("Generating", name)
 		group := cfg["groupName"]
 		version := cfg["version"]
 		kind := name[strings.LastIndex(name, ".")+1:]
 		singular := strings.ToLower(kind)
 		plural := singular + "s"
+		spec := *allSchemas[name]
+		if d, f := descriptions[name]; f {
+			spec.Description = d
+		}
 		schema := &apiext.JSONSchemaProps{
 			Type: "object",
 			Properties: map[string]apiext.JSONSchemaProps{
-				"spec": *allSchemas[name],
+				"spec": spec,
 				"status": {
 					Type:                   "object",
 					XPreserveUnknownFields: Ptr(true),
@@ -535,7 +545,6 @@ func (g *openapiGenerator) generateMessageSchema(message *protomodel.MessageDesc
 	for _, field := range message.Fields {
 		fn := g.fieldName(field)
 		if field.OneofIndex != nil {
-			log.Println(fn, *message.Name, message.OneofDecl)
 			oneOfs[*field.OneofIndex].OneOf = append(oneOfs[*field.OneofIndex].OneOf, apiext.JSONSchemaProps{Required: []string{fn}})
 		}
 		sr := g.fieldType(field)
