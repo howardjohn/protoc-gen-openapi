@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/golang/protobuf/protoc-gen-go/descriptor"
+	"google.golang.org/protobuf/proto"
 )
 
 // CoreDesc is an interface abstracting the abilities shared by all descriptors
@@ -50,18 +51,16 @@ func newBaseDesc(file *FileDescriptor, path pathVector, qualifiedName []string) 
 		if com != "" {
 			cl, newCom = getClass(com)
 			if cl != "" {
-				clone := *loc
-				clone.LeadingComments = &newCom
-				loc = &clone
+				loc = proto.Clone(loc).(*descriptor.SourceCodeInfo_Location)
+				loc.LeadingComments = &newCom
 			}
 		} else {
 			com = loc.GetTrailingComments()
 			if com != "" {
 				cl, newCom = getClass(com)
 				if cl != "" {
-					clone := *loc
-					clone.TrailingComments = &newCom
-					loc = &clone
+					loc = proto.Clone(loc).(*descriptor.SourceCodeInfo_Location)
+					loc.TrailingComments = &newCom
 				}
 			}
 		}

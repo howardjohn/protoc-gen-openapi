@@ -21,7 +21,7 @@ import (
 	plugin "github.com/golang/protobuf/protoc-gen-go/plugin"
 )
 
-// model represents a resolved in-memory version of all the input protos
+// Model represents a resolved in-memory version of all the input protos
 type Model struct {
 	AllFilesByName map[string]*FileDescriptor
 	AllDescByName  map[string]CoreDesc

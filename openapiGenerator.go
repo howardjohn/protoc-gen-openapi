@@ -18,21 +18,22 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"log"
-	"slices"
-	"sort"
 	"strings"
 
-	"github.com/solo-io/protoc-gen-openapi/pkg/protomodel"
-	apiext "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"github.com/getkin/kin-openapi/openapi3"
-	"github.com/ghodss/yaml"
-	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/protoc-gen-go/descriptor"
 	plugin "github.com/golang/protobuf/protoc-gen-go/plugin"
+	"github.com/solo-io/protoc-gen-openapi/pkg/protomodel"
+	"golang.org/x/exp/maps"
+	"google.golang.org/protobuf/proto"
+	apiextinternal "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	apiext "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"sigs.k8s.io/yaml"
+	"slices"
 )
 
 // Some special types with predefined schemas.
@@ -72,34 +73,33 @@ var specialSoloTypes = map[string]*apiext.JSONSchemaProps{
 	"google.protobuf.Int32Value": {
 		Type:     "integer",
 		Nullable: true,
-		//Min: math.MinInt32,
-		//Max: math.MaxInt32,
+		// Min: math.MinInt32,
+		// Max: math.MaxInt32,
 	},
 	"google.protobuf.Int64Value": {
 		Type:     "integer",
 		Nullable: true,
-		//Min: math.MinInt64,
-		//Max: math.MaxInt64,
+		// Min: math.MinInt64,
+		// Max: math.MaxInt64,
 	},
 	"google.protobuf.UInt32Value": {
 		Type:     "integer",
 		Nullable: true,
-		//Min: 0,
-		//Max: math.MaxUInt32,
+		// Min: 0,
+		// Max: math.MaxUInt32,
 	},
 	"google.protobuf.UInt64Value": {
 		Type:     "integer",
 		Nullable: true,
-		//Min: 0,
-		//Max: math.MaxUInt62,
+		// Min: 0,
+		// Max: math.MaxUInt62,
 	},
 	"google.protobuf.FloatValue": {
 		Type:     "number",
 		Nullable: true,
 	},
 	"google.protobuf.Duration": {
-		Type:     "string",
-		Nullable: true,
+		Type: "string",
 	},
 	"google.protobuf.Empty": {
 		Type:          "object",
@@ -115,8 +115,7 @@ type openapiGenerator struct {
 	model *protomodel.Model
 
 	// transient state as individual files are processed
-	currentPackage             *protomodel.PackageDescriptor
-	currentFrontMatterProvider *protomodel.FileDescriptor
+	currentPackage *protomodel.PackageDescriptor
 
 	messages map[string]*protomodel.MessageDescriptor
 
@@ -239,6 +238,7 @@ func cleanComments(lines []string) []string {
 	}
 	return out
 }
+
 func parseGenTags(s string) map[string]string {
 	lines := cleanComments(strings.Split(s, "\n"))
 	res := map[string]string{}
@@ -250,8 +250,6 @@ func parseGenTags(s string) map[string]string {
 		if !f {
 			continue
 		}
-		//res[contents] = ""
-		//continue
 		spl := strings.SplitN(contents[1:], ":", 3)
 		if len(spl) < 2 {
 			log.Fatalf("invalid tag: %v", line)
@@ -260,7 +258,11 @@ func parseGenTags(s string) map[string]string {
 		if len(spl) > 2 {
 			val = spl[2]
 		}
-		res[spl[1]] = val
+		if _, f := res[spl[1]]; f {
+			res[spl[1]] += ";;" + val
+		} else {
+			res[spl[1]] = val
+		}
 	}
 	if len(res) == 0 {
 		return nil
@@ -270,7 +272,6 @@ func parseGenTags(s string) map[string]string {
 
 // Generate an OpenAPI spec for a collection of cross-linked files.
 func (g *openapiGenerator) generateFile(name string, messages map[string]*protomodel.MessageDescriptor, enums map[string]*protomodel.EnumDescriptor, descriptions map[string]string) plugin.CodeGeneratorResponse_File {
-
 	g.messages = messages
 
 	allSchemas := make(map[string]*apiext.JSONSchemaProps)
@@ -301,7 +302,8 @@ func (g *openapiGenerator) generateFile(name string, messages map[string]*protom
 		}
 	}
 
-	crds := []*apiext.CustomResourceDefinition{}
+	// Name -> CRD
+	crds := map[string]*apiext.CustomResourceDefinition{}
 
 	for name, cfg := range genTags {
 		log.Println("Generating", name)
@@ -318,32 +320,13 @@ func (g *openapiGenerator) generateFile(name string, messages map[string]*protom
 			Type: "object",
 			Properties: map[string]apiext.JSONSchemaProps{
 				"spec": spec,
-				"status": {
-					Type:                   "object",
-					XPreserveUnknownFields: Ptr(true),
-				},
 			},
 		}
-		crd := &apiext.CustomResourceDefinition{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: "apiextensions.k8s.io/v1",
-				Kind:       "CustomResourceDefinition",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Annotations: extractKV(cfg["annotations"]),
-				Labels:      extractKV(cfg["labels"]),
-			},
-			Spec: apiext.CustomResourceDefinitionSpec{
-				Group: group,
-				Names: apiext.CustomResourceDefinitionNames{
-					Kind:     kind,
-					ListKind: kind + "List",
-					Plural:   plural,
-					Singular: singular,
-				},
-				Scope: apiext.NamespaceScoped,
-			},
-			Status: apiext.CustomResourceDefinitionStatus{},
+		names := apiext.CustomResourceDefinitionNames{
+			Kind:     kind,
+			ListKind: kind + "List",
+			Plural:   plural,
+			Singular: singular,
 		}
 		ver := apiext.CustomResourceDefinitionVersion{
 			Name:   version,
@@ -354,25 +337,24 @@ func (g *openapiGenerator) generateFile(name string, messages map[string]*protom
 		}
 
 		if res, f := cfg["resource"]; f {
-			for n, m := range extractKV(res) {
-				log.Println(n, m)
+			for n, m := range extractKeyValue(res) {
 				switch n {
 				case "categories":
-					crd.Spec.Names.Categories = mergeSlices(crd.Spec.Names.Categories, strings.Split(m, ","))
+					names.Categories = mergeSlices(names.Categories, strings.Split(m, ","))
 				case "plural":
-					crd.Spec.Names.Plural = m
+					names.Plural = m
 				case "kind":
-					crd.Spec.Names.Kind = m
+					names.Kind = m
 				case "shortNames":
-					crd.Spec.Names.ShortNames = mergeSlices(crd.Spec.Names.ShortNames, strings.Split(m, ","))
+					names.ShortNames = mergeSlices(names.ShortNames, strings.Split(m, ","))
 				case "singular":
-					crd.Spec.Names.Singular = m
+					names.Singular = m
 				case "listKind":
-					crd.Spec.Names.ListKind = m
+					names.ListKind = m
 				}
 			}
 		}
-		crd.Name = crd.Spec.Names.Plural + "." + group
+		name := names.Plural + "." + group
 		if pk, f := cfg["printerColumn"]; f {
 			pcs := strings.Split(pk, ";;")
 			for _, pc := range pcs {
@@ -398,25 +380,63 @@ func (g *openapiGenerator) generateFile(name string, messages map[string]*protom
 		if sr, f := cfg["subresource"]; f {
 			if sr == "status" {
 				ver.Subresources = &apiext.CustomResourceSubresources{Status: &apiext.CustomResourceSubresourceStatus{}}
+				ver.Schema.OpenAPIV3Schema.Properties["status"] = apiext.JSONSchemaProps{
+					Type:                   "object",
+					XPreserveUnknownFields: Ptr(true),
+				}
 			}
 		}
 		if _, f := cfg["storageVersion"]; f {
 			ver.Storage = true
 		}
+		if err := validateStructural(ver.Schema.OpenAPIV3Schema); err != nil {
+			log.Fatalf("failed to validate %v as structural: %v", kind, err)
+		}
+
+		crd, f := crds[name]
+		if !f {
+			crd = &apiext.CustomResourceDefinition{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "apiextensions.k8s.io/v1",
+					Kind:       "CustomResourceDefinition",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: extractKeyValue(cfg["annotations"]),
+					Labels:      extractKeyValue(cfg["labels"]),
+					Name:        name,
+				},
+				Spec: apiext.CustomResourceDefinitionSpec{
+					Group: group,
+					Names: names,
+					Scope: apiext.NamespaceScoped,
+				},
+				Status: apiext.CustomResourceDefinitionStatus{},
+			}
+		}
+
 		crd.Spec.Versions = append(crd.Spec.Versions, ver)
-		crds = append(crds, crd)
+		crds[name] = crd
+		slices.SortFunc(crd.Spec.Versions, func(a, b apiext.CustomResourceDefinitionVersion) int {
+			if a.Name < b.Name {
+				return -1
+			}
+			return 1
+		})
 	}
 
-	slices.SortFunc(crds, func(a, b *apiext.CustomResourceDefinition) int {
-		if a.Name < b.Name {
-			return 1
-		} else {
+	// sort the configs so that the order is deterministic.
+	keys := maps.Keys(crds)
+	slices.SortFunc(keys, func(a, b string) int {
+		if crds[a].Spec.Group+a < crds[b].Spec.Group+b {
 			return -1
 		}
+		return 1
 	})
+
 	bb := &bytes.Buffer{}
 	bb.WriteString("# DO NOT EDIT - Generated by Cue OpenAPI generator based on Istio APIs.\n")
-	for i, crd := range crds {
+	for i, crdName := range keys {
+		crd := crds[crdName]
 		b, err := yaml.Marshal(crd)
 		if err != nil {
 			log.Fatalf("unable to marshall the output of %v to yaml", name)
@@ -435,19 +455,13 @@ func (g *openapiGenerator) generateFile(name string, messages map[string]*protom
 }
 
 func mergeSlices(a []string, b []string) []string {
-	nv := sets.New(a...).Insert(b...).UnsortedList()
-	sort.Strings(nv)
-	return nv
-}
-
-func extractKV(s string) map[string]string {
-	return extractKeyValue(s)
-	res := map[string]string{}
-	for _, i := range strings.Split(s, ",") {
-		k, v, _ := strings.Cut(i, "=")
-		res[k] = v
+	have := sets.New(a...)
+	for _, bb := range b {
+		if !have.Has(bb) {
+			a = append(a, bb)
+		}
 	}
-	return res
+	return a
 }
 
 // extractkeyValue extracts a string to key value pairs
@@ -515,14 +529,6 @@ func (g *openapiGenerator) generateMessage(message *protomodel.MessageDescriptor
 	}
 }
 
-func (g *openapiGenerator) generateSoloInt64Schema() *apiext.JSONSchemaProps {
-	return &apiext.JSONSchemaProps{
-		Type:         "integer",
-		Format:       "int64",
-		XIntOrString: true,
-	}
-}
-
 func (g *openapiGenerator) generateCustomMessageSchema(message *protomodel.MessageDescriptor, customSchema *apiext.JSONSchemaProps) *apiext.JSONSchemaProps {
 	o := customSchema
 	o.Description = g.generateDescription(message)
@@ -541,6 +547,7 @@ func (g *openapiGenerator) generateMessageSchema(message *protomodel.MessageDesc
 	}
 	o.Description = g.generateDescription(message)
 
+	// TODO: represent oneof with CEL
 	oneOfs := make([]apiext.JSONSchemaProps, len(message.OneofDecl))
 	for _, field := range message.Fields {
 		fn := g.fieldName(field)
@@ -573,7 +580,7 @@ func (g *openapiGenerator) generateEnum(enum *protomodel.EnumDescriptor, allSche
 func (g *openapiGenerator) generateEnumSchema(enum *protomodel.EnumDescriptor) *apiext.JSONSchemaProps {
 	o := &apiext.JSONSchemaProps{Type: "string"}
 	// Enum description is not used in Kubernetes
-	//o.Description = g.generateDescription(enum)
+	// o.Description = g.generateDescription(enum)
 
 	// If the schema should be int or string, mark it as such
 	if g.enumAsIntOrString {
@@ -608,19 +615,13 @@ func (g *openapiGenerator) generateDescription(desc protomodel.CoreDesc) string 
 	if strings.Contains(c, "$hide_from_docs") {
 		return ""
 	}
-	t := strings.Split(c, "\n\n")[0]
-	//return strings.Split(t, "\n")[0]
-	//// omit the comment that starts with `$`.
-	//if strings.HasPrefix(t, "$") {
-	//	return ""
-	//}
-
-	idx := strings.Index(t, ".")
-	if idx == -1 {
-		return t
+	words := strings.Fields(c)
+	for i, w := range words {
+		if strings.HasSuffix(w, ".") {
+			return strings.Join(words[:i+1], " ")
+		}
 	}
-	return t[:idx+1]
-	return strings.Join(strings.Fields(t), " ")
+	return ""
 }
 
 func (g *openapiGenerator) fieldType(field *protomodel.FieldDescriptor) *apiext.JSONSchemaProps {
@@ -629,24 +630,31 @@ func (g *openapiGenerator) fieldType(field *protomodel.FieldDescriptor) *apiext.
 	switch *field.Type {
 	case descriptor.FieldDescriptorProto_TYPE_FLOAT, descriptor.FieldDescriptorProto_TYPE_DOUBLE:
 		schema.Type = "number"
+		schema.Format = "double"
 		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_INT32, descriptor.FieldDescriptorProto_TYPE_SINT32, descriptor.FieldDescriptorProto_TYPE_SFIXED32:
 		schema.Type = "integer"
-		//schema.Format = "int32"
+		schema.Format = "int32"
 		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_INT64, descriptor.FieldDescriptorProto_TYPE_SINT64, descriptor.FieldDescriptorProto_TYPE_SFIXED64:
-		schema = g.generateSoloInt64Schema()
+		schema.Type = "integer"
+		// TODO:
+		// schema.Format = "int64"
+		// schema.XIntOrString = true
 		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_UINT64, descriptor.FieldDescriptorProto_TYPE_FIXED64:
-		schema = g.generateSoloInt64Schema()
+		schema.Type = "integer"
+		// TODO:
+		// schema.Format = "int64"
+		// schema.XIntOrString = true
 		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_UINT32, descriptor.FieldDescriptorProto_TYPE_FIXED32:
 		schema.Type = "integer"
-		//schema.Format = "int32"
+		// schema.Format = "int32"
 		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_BOOL:
@@ -664,10 +672,10 @@ func (g *openapiGenerator) fieldType(field *protomodel.FieldDescriptor) *apiext.
 		} else if msg.GetOptions().GetMapEntry() {
 			isMap = true
 			sr := g.fieldType(msg.Fields[1])
-			//schema.Type = "object"
+			// schema.Type = "object"
 			schema = sr
 			schema = &apiext.JSONSchemaProps{
-				//Format: "array",
+				// Format: "array",
 				Type:                 "object",
 				AdditionalProperties: &apiext.JSONSchemaPropsOrBool{Schema: schema},
 			}
@@ -679,7 +687,7 @@ func (g *openapiGenerator) fieldType(field *protomodel.FieldDescriptor) *apiext.
 
 	case descriptor.FieldDescriptorProto_TYPE_BYTES:
 		schema.Type = "string"
-		schema.Format = "byte"
+		schema.Format = "binary"
 		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_ENUM:
@@ -690,7 +698,7 @@ func (g *openapiGenerator) fieldType(field *protomodel.FieldDescriptor) *apiext.
 
 	if field.IsRepeated() && !isMap {
 		schema = &apiext.JSONSchemaProps{
-			//Format: "array",
+			// Format: "array",
 			Type:  "array",
 			Items: &apiext.JSONSchemaPropsOrArray{Schema: schema},
 		}
@@ -716,4 +724,21 @@ func (g *openapiGenerator) relativeName(desc protomodel.CoreDesc) string {
 
 func Ptr[T any](t T) *T {
 	return &t
+}
+
+func validateStructural(s *apiext.JSONSchemaProps) error {
+	out := &apiextinternal.JSONSchemaProps{}
+	if err := apiext.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(s, out, nil); err != nil {
+		return fmt.Errorf("cannot convert v1 JSONSchemaProps to JSONSchemaProps: %v", err)
+	}
+	r, err := structuralschema.NewStructural(out)
+	if err != nil {
+		return fmt.Errorf("cannot convert to a structural schema: %v", err)
+	}
+
+	if errs := structuralschema.ValidateStructural(nil, r); len(errs) != 0 {
+		return fmt.Errorf("schema is not structural: %v", errs.ToAggregate().Error())
+	}
+
+	return nil
 }

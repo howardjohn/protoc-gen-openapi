@@ -18,10 +18,9 @@ import (
 	"fmt"
 	"strings"
 
+	plugin "github.com/golang/protobuf/protoc-gen-go/plugin"
 	"github.com/solo-io/protoc-gen-openapi/pkg/protocgen"
 	"github.com/solo-io/protoc-gen-openapi/pkg/protomodel"
-
-	plugin "github.com/golang/protobuf/protoc-gen-go/plugin"
 )
 
 // Breaks the comma-separated list of key=value pairs
@@ -43,7 +42,7 @@ func extractParams(parameter string) map[string]string {
 	return m
 }
 
-func generate(request plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorResponse, error) {
+func generate(request *plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorResponse, error) {
 	includeDescription := true
 	enumAsIntOrString := false
 
@@ -68,11 +67,11 @@ func generate(request plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorRespons
 				return nil, fmt.Errorf("unknown value '%s' for enum_as_int_or_string", v)
 			}
 		} else {
-			//return nil, fmt.Errorf("unknown argument '%s' specified", k)
+			return nil, fmt.Errorf("unknown argument '%s' specified", k)
 		}
 	}
 
-	m := protomodel.NewModel(&request, false)
+	m := protomodel.NewModel(request, false)
 
 	filesToGen := make(map[*protomodel.FileDescriptor]bool)
 	for _, fileName := range request.FileToGenerate {
